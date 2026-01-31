@@ -25,34 +25,41 @@ HEADERS = {
 # ================= UTILITIES ================= #
 
 def ms_to_hms(ms):
-    td = timedelta(milliseconds=int(ms))
-    total_seconds = int(td.total_seconds())
-    h = total_seconds // 3600
-    m = (total_seconds % 3600) // 60
-    s = total_seconds % 60
-    return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
+    try:
+        td = timedelta(milliseconds=int(ms))
+        total_seconds = int(td.total_seconds())
+        h = total_seconds // 3600
+        m = (total_seconds % 3600) // 60
+        s = total_seconds % 60
+        return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
+    except Exception:
+        return "00:00"
 
 def normalize_text(text: str) -> str:
-    text = re.sub(r"[^\w\s]", " ", text.lower())
+    text = re.sub(r"[^\w\s]", " ", str(text).lower())
     return re.sub(r"\s+", " ", text).strip()
 
 # ================= LOAD TRANSCRIPT ================= #
 
 @st.cache_data(show_spinner=False)
 def load_transcript():
-    """
-    Expected columns:
-    - start (seconds or ms)
-    - end (seconds or ms)
-    - text
-    """
     return joblib.load("video2_embeddings_updated.joblib")
 
 @st.cache_data(show_spinner=False)
 def preprocess_transcript(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["clean_text"] = df["text"].astype(str).apply(normalize_text)
-    df["text_tokens"] = df["clean_text"].str.split().apply(lambda x: set(x))
+
+    if "text" not in df.columns:
+        df["text"] = ""
+
+    df["clean_text"] = df["text"].apply(normalize_text)
+    df["text_tokens"] = df["clean_text"].apply(lambda x: set(x.split()))
+
+    if "start" not in df.columns:
+        df["start"] = 0
+    if "end" not in df.columns:
+        df["end"] = 0
+
     return df
 
 df = preprocess_transcript(load_transcript())
@@ -95,13 +102,13 @@ Answer Requirements:
         response.raise_for_status()
         data = response.json()
 
-        # 🔴 CRITICAL FIX: handle all possible response formats
-        if "response" in data and data["response"]:
-            return data["response"].strip()
-        if "result" in data and data["result"]:
-            return data["result"].strip()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"].strip()
+        if isinstance(data, dict):
+            if "response" in data and data["response"]:
+                return data["response"].strip()
+            if "result" in data and data["result"]:
+                return data["result"].strip()
+            if "choices" in data and data["choices"]:
+                return data["choices"][0]["message"]["content"].strip()
 
         return "⚠️ LLM returned an empty response."
 
@@ -126,47 +133,34 @@ query_tokens = set(normalize_text(query_input).split())
 # ================= SEARCH ================= #
 
 with st.spinner("🔎 Searching transcript..."):
-    df["score"] = df["text_tokens"].apply(
-        lambda tokens: len(tokens.intersection(query_tokens))
+    df["score"] = df["text_tokens"].map(
+        lambda tokens: len(tokens & query_tokens)
     )
 
     top_snippets = (
         df[df["score"] > 0]
         .sort_values("score", ascending=False)
-        .head(3)
+        .head(1)   # ✅ ONLY TOP CHUNK
     )
 
 # ================= CONTEXT FILTER ================= #
 
-TOTAL_SCORE_THRESHOLD = 4
-
-if top_snippets.empty or top_snippets["score"].sum() < TOTAL_SCORE_THRESHOLD:
+if top_snippets.empty:
     context_text = ""
 else:
-    context_blocks = []
-    char_limit = 1500
-    current_len = 0
-
-    for _, row in top_snippets.iterrows():
-        block = f"[{ms_to_hms(row.start)} – {ms_to_hms(row.end)}] {row.text}"
-        if current_len + len(block) > char_limit:
-            break
-        context_blocks.append(block)
-        current_len += len(block)
-
-    context_text = "\n".join(context_blocks)
+    row = top_snippets.iloc[0]
+    context_text = f"[{ms_to_hms(row.start)} – {ms_to_hms(row.end)}] {row.text}"
 
 # ================= DISPLAY TRANSCRIPT ================= #
 
-st.subheader("🔎 Top Relevant Transcript Chunks")
+st.subheader("🔎 Top Relevant Transcript Chunk")
 
 if not top_snippets.empty:
-    for _, row in top_snippets.iterrows():
-        st.write(
-            f"{ms_to_hms(row.start)} – {ms_to_hms(row.end)} | Score: {row.score}"
-        )
-        st.write(row.text)
-        st.markdown("---")
+    row = top_snippets.iloc[0]
+    st.write(
+        f"{ms_to_hms(row.start)} – {ms_to_hms(row.end)} | Score: {row.score}"
+    )
+    st.write(row.text)
 else:
     st.write("No relevant transcript sections found.")
 
