@@ -3,6 +3,7 @@ import pandas as pd
 import joblib
 import requests
 import re
+import time
 from datetime import timedelta
 
 # ================= CONFIG ================= #
@@ -12,8 +13,9 @@ st.set_page_config(
     layout="wide"
 )
 
+# 🔐 USE STREAMLIT SECRETS (IMPORTANT FOR CLOUD)
 RAPIDAPI_URL = "https://open-ai21.p.rapidapi.com/conversationllama"
-RAPIDAPI_KEY = "dcabac9b79msh4bbb16cbc29a17ap1d3c84jsncb0dbb461d84"
+RAPIDAPI_KEY = st.secrets.get("RAPIDAPI_KEY", "")
 RAPIDAPI_HOST = "open-ai21.p.rapidapi.com"
 
 HEADERS = {
@@ -26,33 +28,28 @@ HEADERS = {
 
 def ms_to_hms(ms):
     td = timedelta(milliseconds=int(ms))
-    total_seconds = int(td.total_seconds())
-    h = total_seconds // 3600
-    m = (total_seconds % 3600) // 60
-    s = total_seconds % 60
+    s = int(td.total_seconds())
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
     return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
 
 def normalize_text(text: str) -> str:
-    text = re.sub(r"[^\w\s]", " ", text.lower())
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", str(text)).strip().lower()
 
 # ================= LOAD TRANSCRIPT ================= #
 
 @st.cache_data(show_spinner=False)
 def load_transcript():
-    """
-    Expected columns:
-    - start (seconds or ms)
-    - end (seconds or ms)
-    - text
-    """
-    return joblib.load("video2_embeddings_updated.joblib")
+    df = joblib.load("video2_embeddings_updated.joblib")
+    return df[["start", "end", "text"]]
 
 @st.cache_data(show_spinner=False)
-def preprocess_transcript(df: pd.DataFrame) -> pd.DataFrame:
+def preprocess_transcript(df):
     df = df.copy()
-    df["clean_text"] = df["text"].astype(str).apply(normalize_text)
-    df["text_tokens"] = df["clean_text"].str.split().apply(lambda x: set(x))
+    df["text_clean"] = df["text"].apply(normalize_text)
+
+    # ✅ tuple() avoids Streamlit hashing error
+    df["tokens"] = df["text_clean"].str.split().apply(lambda x: tuple(set(x)))
     return df
 
 df = preprocess_transcript(load_transcript())
@@ -61,23 +58,21 @@ df = preprocess_transcript(load_transcript())
 
 def generate_llm_response(context: str, question: str) -> str:
     prompt = f"""
-You are a senior Java instructor and software engineer.
+You are a senior Java instructor.
 
-Use the transcript context ONLY if it is relevant.
-If context is empty or weak, answer purely from your own knowledge.
+Answer clearly and professionally.
 
-Transcript Context:
-{context if context else "N/A"}
+Context:
+{context[:1000] if context else "N/A"}
 
 Question:
 {question}
 
-Answer Requirements:
-- Clear explanation
+Requirements:
+- Explain concept
 - Java syntax
-- Example code
+- Java code example
 - Best practices
-- Interview-ready response
 """
 
     payload = {
@@ -85,49 +80,55 @@ Answer Requirements:
         "web_access": False
     }
 
-    try:
-        response = requests.post(
-            RAPIDAPI_URL,
-            headers=HEADERS,
-            json=payload,
-            timeout=45
-        )
-        response.raise_for_status()
-        data = response.json()
+    for attempt in range(2):  # 🔁 retry once
+        try:
+            timeout = 30 if attempt == 0 else 60
 
-        # 🔴 CRITICAL FIX: handle all possible response formats
-        if "response" in data and data["response"]:
-            return data["response"].strip()
-        if "result" in data and data["result"]:
-            return data["result"].strip()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"].strip()
+            response = requests.post(
+                RAPIDAPI_URL,
+                headers=HEADERS,
+                json=payload,
+                timeout=timeout
+            )
+            response.raise_for_status()
 
-        return "⚠️ LLM returned an empty response."
+            data = response.json()
+            if "response" in data and data["response"].strip():
+                return data["response"].strip()
 
-    except Exception as e:
-        return f"❌ LLM API Error: {e}"
+            return "⚠️ LLM returned an empty response."
+
+        except requests.exceptions.Timeout:
+            if attempt == 1:
+                return (
+                    "⚠️ The AI service is currently slow.\n\n"
+                    "Please try again after a few seconds."
+                )
+            time.sleep(1)
+
+        except Exception as e:
+            return f"❌ LLM API Error: {e}"
 
 # ================= UI ================= #
 
 st.title("🎥 Video Transcript RAG + Text Assistant")
 
-query_input = st.text_input(
+query = st.text_input(
     "Ask your question:",
     placeholder="Example: What are arithmetic operators in Java?"
 )
 
-if not query_input.strip():
-    st.info("Please enter a question to get started.")
+if not query.strip():
+    st.info("Please enter a question to continue.")
     st.stop()
 
-query_tokens = set(normalize_text(query_input).split())
+query_tokens = set(normalize_text(query).split())
 
-# ================= SEARCH ================= #
+# ================= SEARCH TRANSCRIPT ================= #
 
-with st.spinner("🔎 Searching transcript..."):
-    df["score"] = df["text_tokens"].apply(
-        lambda tokens: len(tokens.intersection(query_tokens))
+with st.spinner("Searching transcript..."):
+    df["score"] = df["tokens"].apply(
+        lambda t: len(query_tokens.intersection(t))
     )
 
     top_snippets = (
@@ -138,29 +139,28 @@ with st.spinner("🔎 Searching transcript..."):
 
 # ================= CONTEXT FILTER ================= #
 
-TOTAL_SCORE_THRESHOLD = 4
+MIN_TOTAL_SCORE = 5
 
-if top_snippets.empty or top_snippets["score"].sum() < TOTAL_SCORE_THRESHOLD:
+if top_snippets.empty or top_snippets["score"].sum() < MIN_TOTAL_SCORE:
     context_text = ""
 else:
     context_blocks = []
-    char_limit = 1500
-    current_len = 0
+    chars = 0
 
     for _, row in top_snippets.iterrows():
-        block = f"[{ms_to_hms(row.start)} – {ms_to_hms(row.end)}] {row.text}"
-        if current_len + len(block) > char_limit:
+        block = f"[{ms_to_hms(row.start)} - {ms_to_hms(row.end)}] {row.text}"
+        if chars + len(block) > 1200:
             break
         context_blocks.append(block)
-        current_len += len(block)
+        chars += len(block)
 
     context_text = "\n".join(context_blocks)
 
 # ================= DISPLAY TRANSCRIPT ================= #
 
-st.subheader("🔎 Top Relevant Transcript Chunks")
+st.subheader("🔎 Relevant Transcript Segments")
 
-if not top_snippets.empty:
+if context_text:
     for _, row in top_snippets.iterrows():
         st.write(
             f"{ms_to_hms(row.start)} – {ms_to_hms(row.end)} | Score: {row.score}"
@@ -168,20 +168,22 @@ if not top_snippets.empty:
         st.write(row.text)
         st.markdown("---")
 else:
-    st.write("No relevant transcript sections found.")
+    st.write("Transcript context not relevant for this question.")
 
 # ================= ANSWER ================= #
 
+with st.spinner("Generating answer..."):
+    answer = generate_llm_response(context_text, query)
+
 st.subheader("💬 Answer")
 
-with st.spinner("🤖 Generating answer..."):
-    answer = generate_llm_response(context_text, query_input)
-
-st.markdown(answer)
+if answer.strip():
+    st.markdown(answer)
+else:
+    st.warning("No response generated. Please try again.")
 
 st.download_button(
     "📥 Download Answer",
     answer,
-    file_name="answer.txt",
-    use_container_width=True
+    file_name="answer.txt"
 )
