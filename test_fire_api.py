@@ -7,7 +7,10 @@ from datetime import timedelta
 
 # ================= CONFIG ================= #
 
-st.set_page_config(page_title="Video RAG + Text Assistant", layout="wide")
+st.set_page_config(
+    page_title="Video RAG + Text Assistant",
+    layout="wide"
+)
 
 RAPIDAPI_URL = "https://open-ai21.p.rapidapi.com/conversationllama"
 RAPIDAPI_KEY = "dcabac9b79msh4bbb16cbc29a17ap1d3c84jsncb0dbb461d84"
@@ -32,25 +35,31 @@ def ms_to_hms(ms):
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
-# ================= LOAD TRANSCRIPT (CACHE ONLY RAW LOAD) ================= #
+# ================= LOAD TRANSCRIPT ================= #
 
 @st.cache_data(show_spinner=False)
 def load_transcript():
+    # Expected columns: start, end, text
     return joblib.load("video2_embeddings_updated.joblib")
 
-df = load_transcript()
+@st.cache_data(show_spinner=False)
+def preprocess_transcript(df):
+    df = df.copy()
+    df["text_lower"] = df["text"].astype(str).str.lower()
+    # tuple() avoids Streamlit hashing error
+    df["text_tokens"] = df["text_lower"].str.split().apply(lambda x: tuple(set(x)))
+    return df
 
-# ================= PREPROCESS (DO NOT CACHE) ================= #
+df = preprocess_transcript(load_transcript())
 
-df = df.copy()
-df["text_lower"] = df["text"].str.lower()
-df["text_tokens"] = df["text_lower"].str.split().apply(set)
-
-# ================= GENERATE RESPONSE ================= #
+# ================= LLM ================= #
 
 def generate_llm_response(context: str, question: str) -> str:
     prompt = f"""
 You are a senior Java instructor and software engineer.
+
+If transcript context is useful, use it.
+If not, answer purely from your own technical knowledge.
 
 Context:
 {context}
@@ -58,12 +67,14 @@ Context:
 Question:
 {question}
 
-Requirements:
-- Clear explanation
-- Java syntax & example
-- Best practices / pitfalls
-- Interview-ready answer
+Answer requirements:
+- Clear, technically accurate explanation
+- Explain syntax and working
+- Provide Java code example
+- Mention best practices or pitfalls
+- Professional, interview-level response
 """
+
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "web_access": False
@@ -72,62 +83,85 @@ Requirements:
     try:
         response = requests.post(
             RAPIDAPI_URL,
-            json=payload,
             headers=HEADERS,
-            timeout=30
+            json=payload,
+            timeout=40
         )
         response.raise_for_status()
         return response.json().get("response", "").strip()
     except Exception as e:
-        return f"LLM Error: {e}"
+        return f"LLM API Error: {e}"
 
 # ================= UI ================= #
 
 st.title("🎥 Video Transcript RAG + Text Assistant")
 
-query_input = st.text_input("Ask your question:")
+query_input = st.text_input(
+    "Ask your question:",
+    placeholder="Example: What are arithmetic operators in Java?"
+)
 
-if query_input.strip():
-    query_tokens = set(query_input.lower().split())
+if not query_input.strip():
+    st.info("Please enter a question to get started.")
+    st.stop()
 
-    with st.spinner("Finding relevant transcript segments..."):
-        df["score"] = df["text_tokens"].apply(
-            lambda tokens: len(tokens & query_tokens)
-        )
+query_tokens = set(query_input.lower().split())
 
-        top_snippets = (
-            df[df["score"] > 0]
-            .sort_values("score", ascending=False)
-            .head(3)
-        )
+with st.spinner("Searching transcript..."):
+    df["score"] = df["text_tokens"].apply(
+        lambda tokens: len(query_tokens.intersection(tokens))
+    )
 
-        if top_snippets.empty:
-            context_text = ""
-        else:
-            context_blocks = []
-            char_count = 0
+    top_snippets = (
+        df[df["score"] > 0]
+        .sort_values("score", ascending=False)
+        .head(3)
+    )
 
-            for _, row in top_snippets.iterrows():
-                block = f"[{ms_to_hms(row.start)} - {ms_to_hms(row.end)}] {row.text}"
-                if char_count + len(block) > 1500:
-                    break
-                context_blocks.append(block)
-                char_count += len(block)
+# ================= CONTEXT FILTER (CRITICAL FIX) ================= #
 
-            context_text = "\n".join(context_blocks)
+TOTAL_SCORE_THRESHOLD = 5
 
-    st.subheader("🔎 Top Relevant Transcript Chunks")
+if top_snippets.empty or top_snippets["score"].sum() < TOTAL_SCORE_THRESHOLD:
+    # Ignore transcript entirely if relevance is weak
+    context_text = ""
+else:
+    context_blocks = []
+    char_count = 0
+
     for _, row in top_snippets.iterrows():
-        st.write(f"{ms_to_hms(row.start)} – {ms_to_hms(row.end)} | Score: {row.score}")
+        snippet = f"[{ms_to_hms(row.start)} - {ms_to_hms(row.end)}] {row.text}"
+        if char_count + len(snippet) > 1500:
+            break
+        context_blocks.append(snippet)
+        char_count += len(snippet)
+
+    context_text = "\n".join(context_blocks)
+
+# ================= DISPLAY TRANSCRIPT ================= #
+
+st.subheader("🔎 Top Relevant Transcript Chunks")
+
+if context_text:
+    for _, row in top_snippets.iterrows():
+        st.write(
+            f"{ms_to_hms(row.start)} – {ms_to_hms(row.end)} | Score: {row.score}"
+        )
         st.write(row.text)
         st.markdown("---")
+else:
+    st.write("Transcript context not relevant for this question.")
 
+# ================= ANSWER ================= #
+
+with st.spinner("Generating answer..."):
     answer = generate_llm_response(context_text, query_input)
 
-    st.subheader("💬 Answer")
-    st.markdown(answer)
+st.subheader("💬 Answer")
+st.markdown(answer)
 
-    st.download_button("Download Answer", answer, "answer.txt")
-
-else:
-    st.info("Please enter a question to get started.")
+st.download_button(
+    "📥 Download Answer",
+    answer,
+    file_name="answer.txt"
+)
