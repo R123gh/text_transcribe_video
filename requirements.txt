@@ -3,4 +3,4 @@ pandas
 numpy
 joblib
 requests
-faster-whisper
+
