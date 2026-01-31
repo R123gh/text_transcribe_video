@@ -15,7 +15,7 @@ st.set_page_config(
 
 # 🔐 USE STREAMLIT SECRETS (IMPORTANT FOR CLOUD)
 RAPIDAPI_URL = "https://open-ai21.p.rapidapi.com/conversationllama"
-RAPIDAPI_KEY = st.secrets.get("RAPIDAPI_KEY", "")
+RAPIDAPI_KEY = st.secrets.get("dcabac9b79msh4bbb16cbc29a17ap1d3c84jsncb0dbb461d84", "")
 RAPIDAPI_HOST = "open-ai21.p.rapidapi.com"
 
 HEADERS = {
@@ -187,3 +187,4 @@ st.download_button(
     answer,
     file_name="answer.txt"
 )
+
